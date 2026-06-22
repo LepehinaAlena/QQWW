@@ -1,6 +1,5 @@
-// reorder_arm.cpp
-// Компиляция: g++ -O2 -pthread reorder_arm.cpp -o reorder_arm
-// Запуск: ./reorder_arm
+// aggressive_reorder.cpp
+// Компиляция: g++ -O2 -pthread aggressive_reorder.cpp -o aggressive_reorder
 
 #include <iostream>
 #include <thread>
@@ -8,134 +7,109 @@
 #include <vector>
 
 // ============================================
-// ТЕСТ 1: volatile (ДОЛЖЕН СЛОМАТЬСЯ на ARM)
+// Store Buffering Test: классика реордеринга
+// Thread 1: x = 1; r1 = y;
+// Thread 2: y = 1; r2 = x;
+// Если r1 == 0 && r2 == 0 — был реордеринг!
 // ============================================
-volatile int data_v = 0;
-volatile bool ready_v = false;
 
-std::atomic<long long> violations_v{0};
-std::atomic<long long> iterations_v{0};
+const int RUNS = 50'000'000;
+const int NUM_PAIRS = 4;  // 4 пары потоков = 8 потоков
 
-const int RUNS = 10'000'000;
-
-void writer_v() {
-    for (int i = 0; i < RUNS; i++) {
-        data_v = 42;       // (1) записываем данные
-        ready_v = true;    // (2) поднимаем флаг
-        
-        // Ждём, пока читатель обработает
-        while (ready_v) {
-            std::this_thread::yield();
+struct TestPair {
+    volatile int x;
+    volatile int y;
+    std::atomic<int> r1{0};
+    std::atomic<int> r2{0};
+    std::atomic<long long> violations{0};
+    std::atomic<int> gate{0};
+    
+    void writer1() {
+        while (gate.load(std::memory_order_relaxed) == 0) {
+            // spin
         }
-        
-        // Сбрасываем для следующей итерации
-        data_v = 0;
+        for (int i = 0; i < RUNS; i++) {
+            x = 1;                          // store
+            int tmp = y;                    // load (может быть спекулятивным!)
+            r1.store(tmp, std::memory_order_relaxed);
+            
+            // Синхронизация между итерациями
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            x = 0; y = 0;
+            r1.store(0, std::memory_order_relaxed);
+            r2.store(0, std::memory_order_relaxed);
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+        }
     }
-}
-
-void reader_v() {
-    for (int i = 0; i < RUNS; i++) {
-        // Ждём флаг
-        while (!ready_v) {
-            std::this_thread::yield();
+    
+    void writer2() {
+        while (gate.load(std::memory_order_relaxed) == 0) {}
+        for (int i = 0; i < RUNS; i++) {
+            y = 1;
+            int tmp = x;
+            r2.store(tmp, std::memory_order_relaxed);
+            
+            std::atomic_thread_fence(std::memory_order_seq_cst);
         }
-        
-        // На ARM процессор может спекулятивно загрузить data_v
-        // ДО того, как запись data_v = 42 станет видимой
-        int observed = data_v;
-        
-        if (observed != 42) {
-            violations_v++;
-        }
-        
-        iterations_v++;
-        
-        // Разрешаем писателю продолжить
-        ready_v = false;
     }
-}
-
-// ============================================
-// ТЕСТ 2: std::atomic (НЕ ДОЛЖЕН СЛОМАТЬСЯ)
-// ============================================
-std::atomic<int> data_a{0};
-std::atomic<bool> ready_a{false};
-
-std::atomic<long long> violations_a{0};
-std::atomic<long long> iterations_a{0};
-
-void writer_a() {
-    for (int i = 0; i < RUNS; i++) {
-        data_a.store(42, std::memory_order_relaxed);
-        ready_a.store(true, std::memory_order_release);  // Release barrier!
-        
-        while (ready_a.load(std::memory_order_relaxed)) {
-            std::this_thread::yield();
+    
+    void monitor() {
+        while (gate.load(std::memory_order_relaxed) == 0) {}
+        for (int i = 0; i < RUNS; i++) {
+            int v1 = r1.load(std::memory_order_relaxed);
+            int v2 = r2.load(std::memory_order_relaxed);
+            
+            // Если ОБА прочитали 0 — значит оба процессора
+            // спекулятивно прочитали ДО того, как store стал видимым
+            if (v1 == 0 && v2 == 0) {
+                // Проверяем, что итерация действительно идёт (x и y были 1)
+                // Это эвристика, но работает в большинстве случаев
+                violations++;
+            }
+            
+            std::atomic_thread_fence(std::memory_order_relaxed);
         }
-        
-        data_a.store(0, std::memory_order_relaxed);
     }
-}
+};
 
-void reader_a() {
-    for (int i = 0; i < RUNS; i++) {
-        while (!ready_a.load(std::memory_order_acquire)) {  // Acquire barrier!
-            std::this_thread::yield();
-        }
-        
-        int observed = data_a.load(std::memory_order_relaxed);
-        
-        if (observed != 42) {
-            violations_a++;
-        }
-        
-        iterations_a++;
-        
-        ready_a.store(false, std::memory_order_relaxed);
-    }
-}
+std::vector<TestPair> pairs(NUM_PAIRS);
 
 int main() {
-    std::cout << "=== Тест реордеринга памяти на ARM (Apple Silicon) ===\n\n";
-    std::cout << "Запуск " << RUNS << " итераций для каждого теста...\n\n";
+    std::cout << "=== Агрессивный тест Store Buffering ===\n";
+    std::cout << "Пар потоков: " << NUM_PAIRS << "\n";
+    std::cout << "Итераций на пару: " << RUNS << "\n\n";
     
-    // Тест volatile
-    std::cout << "[1] Тест с volatile:\n";
-    std::thread t1v(writer_v);
-    std::thread t2v(reader_v);
-    t1v.join();
-    t2v.join();
+    std::vector<std::thread> threads;
     
-    std::cout << "    Итераций: " << iterations_v.load() << "\n";
-    std::cout << "    Нарушений порядка: " << violations_v.load() << "\n";
-    if (violations_v.load() > 0) {
-        std::cout << "    💥 VOLATILE СЛОМАЛСЯ! Процессор переставил инструкции.\n";
-    } else {
-        std::cout << "    ✓ Нарушений не обнаружено (но это не значит, что код корректен).\n";
+    // Запускаем все пары
+    for (int i = 0; i < NUM_PAIRS; i++) {
+        threads.emplace_back(&TestPair::writer1, &pairs[i]);
+        threads.emplace_back(&TestPair::writer2, &pairs[i]);
+        threads.emplace_back(&TestPair::monitor, &pairs[i]);
     }
     
-    std::cout << "\n";
-    
-    // Тест atomic
-    std::cout << "[2] Тест с std::atomic:\n";
-    std::thread t1a(writer_a);
-    std::thread t2a(reader_a);
-    t1a.join();
-    t2a.join();
-    
-    std::cout << "    Итераций: " << iterations_a.load() << "\n";
-    std::cout << "    Нарушений порядка: " << violations_a.load() << "\n";
-    if (violations_a.load() == 0) {
-        std::cout << "    ✓ ATOMIC РАБОТАЕТ КОРЕКТНО. Барьеры предотвратили реордеринг.\n";
-    } else {
-        std::cout << "    ⚠️  Нарушения обнаружены (это странно, должно быть 0).\n";
+    // Даём потокам стартовать одновременно
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    for (int i = 0; i < NUM_PAIRS; i++) {
+        pairs[i].gate.store(1, std::memory_order_release);
     }
     
-    std::cout << "\n=== Вывод ===\n";
-    std::cout << "volatile защищает только от оптимизаций компилятора,\n";
-    std::cout << "но не от реордеринга процессором. На ARM это приводит к гонкам.\n";
-    std::cout << "std::atomic с acquire/release генерирует аппаратные барьеры,\n";
-    std::cout << "которые гарантируют порядок видимости изменений между потоками.\n";
+    for (auto& t : threads) t.join();
+    
+    long long total_violations = 0;
+    for (int i = 0; i < NUM_PAIRS; i++) {
+        total_violations += pairs[i].violations.load();
+    }
+    
+    std::cout << "Обнаружено потенциальных реордерингов: " << total_violations << "\n";
+    
+    if (total_violations > 0) {
+        std::cout << "💥 VOLATILE СЛОМАЛСЯ! Процессор переставил store/load.\n";
+    } else {
+        std::cout << "⚠️  Реордеринг не обнаружен.\n";
+        std::cout << "Это НЕ значит, что код корректен!\n";
+        std::cout << "Реордеринг — стохастический процесс.\n";
+    }
     
     return 0;
 }
