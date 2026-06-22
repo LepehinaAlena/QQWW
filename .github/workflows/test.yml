@@ -10,7 +10,7 @@ jobs:
     - uses: actions/checkout@v4
     
     - name: Compile
-      run: g++ -O2 -pthread reorder_asm.cpp -o store_buffering
+      run: g++ -O2 -pthread reorder_arm.cpp -o store_buffering
     
     - name: Run test
       run: ./store_buffering
